@@ -1,14 +1,14 @@
 /*
  *******************************************************************************
  *
- *   Copyright (C) 1999-2001, International Business Machines
- *   Corporation and others.  All Rights Reserved.
+ * Copyright (C) 1999-2001, International Business Machines
+ * Corporation and others.  All Rights Reserved.
  *
  *******************************************************************************
- *   file name:  scrptrun.cpp
+ * file name:  scrptrun.cpp
  *
- *   created on: 10/17/2001
- *   created by: Eric R. Mader
+ * created on: 10/17/2001
+ * created by: Eric R. Mader
  *
  * NOTE: This file is copied from ICU.
  * http://source.icu-project.org/repos/icu/icu/trunk/license.html
@@ -21,6 +21,16 @@
 #pragma GCC diagnostic pop
 
 #include <mapnik/text/scrptrun.hpp>
+
+// --- Added includes for diagnostics ---
+#include <cstdio>    // For fprintf, stderr, fflush
+#include <cstdlib>   // For abort
+#include <vector>    // Assuming parenStack uses std::vector based on emplace_back
+#include <stdexcept> // Optional: For throwing instead of aborting
+
+// --- Assuming StackElement struct is defined in scrptrun.hpp or accessible ---
+// (If not, you might need struct StackElement { int32_t pairIndex; UScriptCode scriptCode; }; here)
+// Assuming parenStack is declared in ScriptRun class as std::vector<StackElement> parenStack;
 
 template <class T, std::size_t N>
 constexpr std::size_t ARRAY_SIZE(const T (&array)[N]) noexcept
@@ -59,34 +69,12 @@ int8_t ScriptRun::highBit(int32_t value)
     if (value <= 0) {
         return -32;
     }
-
     int8_t bit = 0;
-
-    if (value >= 1 << 16) {
-        value >>= 16;
-        bit += 16;
-    }
-
-    if (value >= 1 << 8) {
-        value >>= 8;
-        bit += 8;
-    }
-
-    if (value >= 1 << 4) {
-        value >>= 4;
-        bit += 4;
-    }
-
-    if (value >= 1 << 2) {
-        value >>= 2;
-        bit += 2;
-    }
-
-    if (value >= 1 << 1) {
-        value >>= 1;
-        bit += 1;
-    }
-
+    if (value >= 1 << 16) { value >>= 16; bit += 16; }
+    if (value >= 1 << 8)  { value >>= 8;  bit += 8;  }
+    if (value >= 1 << 4)  { value >>= 4;  bit += 4;  }
+    if (value >= 1 << 2)  { value >>= 2;  bit += 2;  }
+    if (value >= 1 << 1)  { value >>= 1;  bit += 1;  }
     return bit;
 }
 
@@ -119,95 +107,141 @@ UBool ScriptRun::sameScript(int32_t scriptOne, int32_t scriptTwo)
     return scriptOne <= USCRIPT_INHERITED || scriptTwo <= USCRIPT_INHERITED || scriptOne == scriptTwo;
 }
 
+
+// --- Diagnostic Macro Definition ---
+// Checks condition, prints context and aborts if true.
+// Ensure scriptStart is declared before using this inside the loop.
+#define CHECK_FATAL(condition, ...) \
+    do { \
+        if (condition) { \
+            fprintf(stderr, "[ScriptRun::next PRE-CRASH DETECTED] "); \
+            fprintf(stderr, __VA_ARGS__); \
+            /* Print context state just before aborting */ \
+            fprintf(stderr, "\n  --> State: scriptStart=%d, scriptEnd=%d, charLimit=%d, parenSP=%d, startSP=%d, parenStack.size()=%zu, charArray=%p\n", \
+                    (int)scriptStart, (int)scriptEnd, (int)charLimit, (int)parenSP, (int)startSP, parenStack.size(), (void*)charArray); \
+            fflush(stderr); \
+            abort(); /* Force stop */ \
+        } \
+    } while (false)
+
+
+// --- Modified ScriptRun::next() method ---
 UBool ScriptRun::next()
 {
-    int32_t startSP  = parenSP;  // used to find the first new open character
+    // Check initial state only if obviously fatal
+    if (charArray == nullptr) {
+         // Need to handle context vars potentially not being initialized here
+         fprintf(stderr, "[ScriptRun::next PRE-CRASH DETECTED] FATAL AT ENTRY: charArray is NULL! charLimit=%d, parenSP=%d\n",
+                 (int)charLimit, (int)parenSP);
+         fflush(stderr);
+         abort();
+    }
+
+    int32_t startSP  = parenSP;
     UErrorCode error = U_ZERO_ERROR;
 
-    // if we've fallen off the end of the text, we're done
     if (scriptEnd >= charLimit) {
         return false;
     }
-    
+
     scriptCode = USCRIPT_COMMON;
 
-    for (scriptStart = scriptEnd; scriptEnd < charLimit; scriptEnd += 1) {
-        UChar   high = charArray[scriptEnd];
-        UChar32 ch   = high;
+    // Declare scriptStart here for use in CHECK_FATAL context inside loop
+    int32_t scriptStart = scriptEnd;
 
-        // if the character is a high surrogate and it's not the last one
-        // in the text, see if it's followed by a low surrogate
+    for (scriptStart = scriptEnd; scriptEnd < charLimit; scriptEnd += 1) {
+
+        // --- Check conditions JUST before the primary suspected crash site ---
+        CHECK_FATAL(charArray == nullptr, "FATAL: charArray became NULL!");
+        CHECK_FATAL(scriptEnd >= charLimit, "FATAL: Index OOB! scriptEnd=%d >= charLimit=%d", (int)scriptEnd, (int)charLimit);
+
+        // --- Original Crash Line ---
+        // If it crashes here WITHOUT a message above, charArray is likely a non-null, invalid pointer (dangling/corrupted).
+        UChar high = charArray[scriptEnd];
+        UChar32 ch = high;
+
+        // --- Check before reading low surrogate ---
         if (high >= 0xD800 && high <= 0xDBFF && scriptEnd < charLimit - 1)
         {
-            UChar low = charArray[scriptEnd + 1];
+            int32_t lowSurrogateIndex = scriptEnd + 1;
+            // Check pointer and index for the NEXT character read
+            CHECK_FATAL(charArray == nullptr, "FATAL: charArray NULL before low surrogate read!");
+            CHECK_FATAL(lowSurrogateIndex >= charLimit, "FATAL: Index OOB for low surrogate! index=%d >= charLimit=%d", (int)lowSurrogateIndex, (int)charLimit);
 
-            // if it is followed by a low surrogate,
-            // consume it and form the full character
+            UChar low = charArray[lowSurrogateIndex]; // Potential crash site #2
+
             if (low >= 0xDC00 && low <= 0xDFFF) {
                 ch = (high - 0xD800) * 0x0400 + low - 0xDC00 + 0x10000;
-                scriptEnd += 1;
+                scriptEnd += 1; // Increment scriptEnd only AFTER successful read
             }
         }
 
         UScriptCode sc = uscript_getScript(ch, &error);
         int32_t pairIndex = getPairIndex(ch);
 
-        // Paired character handling:
-        //
-        // if it's an open character, push it onto the stack.
-        // if it's a close character, find the matching open on the
-        // stack, and use that script code. Any non-matching open
-        // characters above it on the stack will be poped.
         if (pairIndex >= 0) {
-            if ((pairIndex & 1) == 0) {
+            if ((pairIndex & 1) == 0) { // Open character
                 ++parenSP;
-                parenStack.emplace_back(pairIndex, scriptCode);
-                startSP = parenSP;
-            } else if (parenSP >= 0) {
+                parenStack.emplace_back(pairIndex, scriptCode); // Assumes this is safe
+                startSP = parenSP; // Matches user provided code
+            } else if (parenSP >= 0) { // Close character
                 int32_t pi = pairIndex & ~1;
 
-                while (parenSP >= 0 && parenStack[parenSP].pairIndex != pi) {
-                    parenSP -= 1;
+                // Check accesses inside the close-pair search loop
+                while (parenSP >= 0) {
+                    // Check index BEFORE accessing parenStack[parenSP] in condition/body
+                    CHECK_FATAL(static_cast<size_t>(parenSP) >= parenStack.size(), "FATAL: Index OOB in close-pair search! parenSP=%d >= size=%zu", (int)parenSP, parenStack.size());
+                    if(parenStack[parenSP].pairIndex != pi) {
+                         parenSP -= 1;
+                    } else {
+                         break; // Found
+                    }
                 }
 
                 if (parenSP < startSP) {
                     startSP = parenSP;
                 }
 
+                // Check index BEFORE accessing parenStack[parenSP] to get script code
                 if (parenSP >= 0) {
+                    CHECK_FATAL(static_cast<size_t>(parenSP) >= parenStack.size(), "FATAL: Index OOB getting script code! parenSP=%d >= size=%zu", (int)parenSP, parenStack.size());
                     sc = parenStack[parenSP].scriptCode;
                 }
             }
-        }
+        } // End paired character handling
 
         if (sameScript(scriptCode, sc)) {
             if (scriptCode <= USCRIPT_INHERITED && sc > USCRIPT_INHERITED) {
                 scriptCode = sc;
 
-                // now that we have a final script code, fix any open
-                // characters we pushed before we knew the script code.
-                while (startSP < parenSP) {
+                // Check access in the script fixup loop
+                // Pre-check loop: Verify indices that will be accessed
+                 int32_t temp_startSP = startSP;
+                 while(temp_startSP < parenSP) {
+                    int32_t index_to_access = temp_startSP + 1;
+                    CHECK_FATAL(static_cast<size_t>(index_to_access) >= parenStack.size(), "FATAL: Index OOB pre-check in script fixup! index=%d >= size=%zu", (int)index_to_access, parenStack.size());
+                    temp_startSP++;
+                 }
+                 // Original loop - relies on pre-check. Accesses index startSP+1 up to parenSP
+                 while (startSP < parenSP) {
                     parenStack[++startSP].scriptCode = scriptCode;
-                }
-            }
+                 }
+            } // End inherited script handling
 
-            // if this character is a close paired character,
-            // pop it from the stack
+            // Pop stack for close paired character
             if (pairIndex >= 0 && (pairIndex & 1) != 0 && parenSP >= 0) {
                 parenSP -= 1;
                 startSP -= 1;
+                 // Optional: check if startSP becomes excessively negative?
+                 // CHECK_FATAL(startSP < -10, "WARNING: startSP unusually low (%d) after pop", (int)startSP);
             }
-        } else {
-            // if the run broke on a surrogate pair,
-            // end it before the high surrogate
-            if (ch >= 0x10000) {
+        } else { // Script break
+            if (ch >= 0x10000) { // Broke on surrogate pair
                 scriptEnd -= 1;
             }
-
-            break;
+            break; // Exit for loop
         }
-    }
+    } // End for loop
 
     return true;
-}
-
+} // End function
